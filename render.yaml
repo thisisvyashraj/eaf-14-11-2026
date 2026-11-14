@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: trace-farmer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: GROUP
+        sync: false
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false
+      - key: CONTROL_KEY
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: SEND_DELAY
+        value: "2.8"
