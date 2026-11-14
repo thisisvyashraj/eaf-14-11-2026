@@ -14,13 +14,17 @@ What changed in v3
     (CONTROL_KEY) and the console window.
 All secrets come from environment variables.
 """
-import asyncio, os, re, random, time, logging, json, sys, threading, collections
+import asyncio, os, re, random, time, logging, json, sys, threading, collections, io
 from datetime import datetime, timedelta, timezone
 import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 import cfai                                         # Cloudflare Workers AI (free LLM) helper
+try:
+    import tuner as tuner_mod                      # self-tuning from finished rounds
+except Exception:                                  # pragma: no cover
+    tuner_mod = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("trace")
@@ -68,7 +72,7 @@ def _ids(*names):
 OWNERS = _ids("OWNER_IDS", "OWNER_ID")                  # numeric Telegram ids of everyone allowed to control the bot (comma separated)
 STOP_AFTER_ROUNDS = int(os.getenv("STOP_AFTER_ROUNDS", "0") or 0)      # optional timer at startup: pause after N finished rounds
 STOP_AFTER_HOURS = float(os.getenv("STOP_AFTER_HOURS", "0") or 0)      # ... and/or after N hours
-VERSION = "4.1"
+VERSION = "5.0"
 LEGACY_LLM = os.getenv("LEGACY_LLM", "0") == "1"           # old Groq/Gemini/OpenRouter helpers: off by default (quota-exhausted, only spam the log)
 TRACE_BACKOFF_BASE = float(os.getenv("TRACE_BACKOFF_BASE", "60"))   # after an unanswered .trace wait 60 s, then 120, 240 ... (never spam)
 TRACE_BACKOFF_MAX = float(os.getenv("TRACE_BACKOFF_MAX", "600"))
@@ -116,6 +120,13 @@ class S:                       # all bot state
     reply_evt = None           # set when Iris answered our pending guess
     ack_evt = None             # set on any Trace message from Iris
     round_id = 0
+    last_nopick = 0.0
+    rounds = []                # finished rounds: [{'answer','ranks'}] - what the self-tuner learns from
+    saved_params = None        # tuned parameters (loaded from / saved to Saved Messages)
+    state_msg_id = None        # the Saved Messages file that holds rounds + params + answers
+    tuner_obj = None
+    last_tune = 'never'
+    tune_busy = False
     trace_streak = 0           # .trace sent in a row without ANY answer from Iris (drives the back-off)
     trace_sends = 0
     last_sent = 0.0
@@ -200,6 +211,7 @@ TAKEN_RE = re.compile(r"already taken", re.I)
 NOTWORD_RE = re.compile(r"not a word|don'?t recogni[sz]e|not recogni[sz]ed|invalid word", re.I)
 WINNER_RE = re.compile(r"Winner:\s*(.+)")
 ANSWER_RE = re.compile(r"Answer:\s*([A-Za-z]+)")
+SESSION_ANNOUNCE = re.compile(r"Join\s*[—–-]+\s*/trace", re.I)       # Iris' newer "WORD TRACE ... Join — /trace" announcement of a new session
 PLAIN_WORD = re.compile(r"^[A-Za-z]{2,25}$")
 MARKERS = ("TRACE", "already taken", "not a word", "recogni", "invalid word")
 
@@ -467,10 +479,14 @@ async def on_msg(event):
                 log.info("ROUNDDATA %s", json.dumps({"answer": answer, "ranks": dict(sorted(S.known.items(), key=lambda kv: kv[1])[:40])}))
                 log.info("TRACE COMPLETE | answer=%s winner=%s %s | my guesses=%d | my wins=%d (~%d aura)",
                          answer, winner, "(ME!)" if mine else "(someone else)", S.round_guesses, S.my_wins, S.my_wins * 500)
+                if answer and len(S.known) >= 6:
+                    S.rounds.append({"answer": answer, "ranks": trim_ranks(S.known)})
+                    S.rounds = S.rounds[-60:]
+                asyncio.ensure_future(after_round())
                 finish_round("trace complete", count=True)
             return
 
-        if "Group session started" in text:
+        if "Group session started" in text or SESSION_ANNOUNCE.search(text):
             if event.message.id == S.session_msg_id and S.active:     # Iris EDITS this message during a round: ignore
                 S.ack_evt.set(); return
             if S.active and S.round_guesses > 0 and time.time() - S.last_gameplay < 15:
@@ -710,7 +726,10 @@ async def fallback_words(http, n):
     if words:
         log.info("GUESS [llm] %s", ", ".join(words[:n]))
         return words[:n]
+    m = EMB.get("model")
     pool = [w for w in VOCAB_LIST[:15000] if w not in S.tried] or [w for w in SEEDS if w not in S.tried]
+    if not pool and m is not None:                         # seeds used up: any common word from the solver's own vocabulary
+        pool = [w for w in m.words[:30000] if len(w) >= 4 and w not in S.tried]
     w = random.sample(pool, min(n, len(pool))) if pool else []
     log.warning("GUESS [EMERGENCY/random - solver not active] %s", ", ".join(w))
     return w
@@ -834,7 +853,7 @@ def status_text():
             + f" | solver: {EMB['state']} | rounds finished: {S.games} | my wins: {S.my_wins} (~{S.my_wins * 500} aura)"
             + f" | LLM: {'off (no CF keys)' if not cfai.enabled else ('cooling down' if cfai.blocked() else 'on')} ok={cfai.state['ok']}/{cfai.state['calls']}"
             + f" | memory {_rss_now():.0f} MB"
-            + f" | .trace sent: {S.trace_sends}"
+            + f" | .trace sent: {S.trace_sends} | learning: {len(S.rounds)} rounds, last tune: {S.last_tune}"
             + f" | answers remembered: {len(S.answers)} | guess delay: {SEND_DELAY + S.extra:.1f}s")
 
 
@@ -1027,7 +1046,7 @@ async def h_rounds(request):
 async def h_debug(request):
     if not CONTROL_KEY or request.query.get("key") != CONTROL_KEY:
         return web.Response(status=403, text="set CONTROL_KEY on Render and open /debug?key=THAT_PASSWORD")
-    txt = status_text() + "\n" + f"solver state: {EMB['state']} | tried words this round: {len(S.tried)} | known ranks: {len(S.known)}\n\n" + "\n".join(list(RING.buf)[-200:])
+    txt = status_text() + "\n" + f"params: {current_params()}\nsolver state: {EMB['state']} | tried words this round: {len(S.tried)} | known ranks: {len(S.known)}\n\n" + "\n".join(list(RING.buf)[-200:])
     return web.Response(text=txt, content_type="text/plain")
 
 
@@ -1070,6 +1089,126 @@ def start_console():
     log.info("Console controls on: type pause / resume / status here and press Enter")
 
 
+# ---------------- learning: state in Saved Messages + self-tuning ----------------
+STATE_NAME = "tracebot_state.json"
+TUNE_BUDGET = float(os.getenv("TUNE_BUDGET", "40"))
+TUNE_MIN_ROUNDS = int(os.getenv("TUNE_MIN_ROUNDS", "4"))
+SEED_FILE = "seed_rounds.json"
+
+
+def trim_ranks(known, n=60):
+    """keep the closest n/2 guesses and an even spread of the rest (keeps the saved file small)"""
+    items = sorted(known.items(), key=lambda kv: kv[1])
+    if len(items) <= n:
+        return dict(items)
+    h = n // 2
+    rest = items[h:]; step = max(1, len(rest) // (n - h))
+    return dict(items[:h] + rest[::step][:n - h])
+
+
+def current_params():
+    m = EMB.get("model")
+    if m is None:
+        return None
+    p = m.get_params()
+    p["mw0"] = p["mw"][0]
+    return p
+
+
+def apply_params(p):
+    m = EMB.get("model")
+    if m is None or not p:
+        return
+    q = {k: p[k] for k in m.PARAM_NAMES if k in p}
+    if "mw0" in p:
+        q["mw"] = [float(p["mw0"])] + [1.0] * (len(m.m) - 1)
+    elif "mw" in p:
+        q["mw"] = p["mw"]
+    m.set_params(q)
+    log.info("solver parameters now: %s", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in current_params().items() if k != "mw"})
+
+
+async def save_state():
+    """rounds + tuned parameters + answers -> one file in the bot account's Saved Messages (Render wipes its own disk on every restart)"""
+    try:
+        data = json.dumps({"v": 1, "answers": S.answers[-500:], "params": S.saved_params, "rounds": S.rounds[-60:]}).encode()
+        bio = io.BytesIO(data); bio.name = STATE_NAME
+        msg = await client.send_file("me", bio, caption="TRACEBOT_STATE - the bot's memory (answers, learned settings). Please do not delete.", force_document=True)
+        old = S.state_msg_id
+        S.state_msg_id = msg.id
+        if old and old != msg.id:
+            try:
+                await client.delete_messages("me", [old])
+            except Exception:
+                pass
+        log.info("state saved to Saved Messages (%d rounds, %d answers, %d bytes)", len(S.rounds), len(S.answers), len(data))
+    except Exception as e:
+        log.warning("could not save state: %r", e)
+
+
+async def load_state():
+    try:
+        async for m in client.iter_messages("me", limit=200):
+            if getattr(m, "file", None) is not None and getattr(m.file, "name", None) == STATE_NAME:
+                raw = await m.download_media(file=bytes)
+                d = json.loads(raw)
+                S.state_msg_id = m.id
+                for w in d.get("answers", []):
+                    if isinstance(w, str) and w.isalpha() and w not in S.answers:
+                        S.answers.append(w.lower())
+                S.rounds = [r for r in d.get("rounds", []) if r.get("answer") and r.get("ranks")]
+                S.saved_params = d.get("params")
+                log.info("state loaded from Saved Messages: %d rounds, %d answers, tuned params: %s", len(S.rounds), len(S.answers), "yes" if S.saved_params else "no")
+                break
+    except Exception as e:
+        log.warning("could not load state: %r", e)
+    if not S.rounds:                                          # first start: begin with the rounds I have real logs for
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), SEED_FILE), encoding="utf8") as fh:
+                S.rounds = json.load(fh)
+            log.info("started with %d seed rounds", len(S.rounds))
+        except Exception:
+            pass
+    m = EMB.get("model")
+    if m is not None:
+        m.set_history(S.answers)
+
+
+async def tune_now(force=False):
+    """re-tune the solver on all stored rounds (small time slice, runs in a worker thread)"""
+    m = EMB.get("model")
+    if m is None or tuner_mod is None or S.tune_busy:
+        return
+    S.tune_busy = True
+    try:
+        if S.tuner_obj is None:
+            S.tuner_obj = tuner_mod.Tuner(m)
+        cur = current_params()
+        cur = {k: cur[k] for k in ("nt", "cw", "tpw", "far_w", "cprior", "mw0")}
+        loop = asyncio.get_running_loop()
+        new, info = await loop.run_in_executor(None, lambda: S.tuner_obj.tune(list(S.rounds), cur, TUNE_BUDGET, TUNE_MIN_ROUNDS))
+        if new:
+            S.saved_params = new
+            apply_params(new)
+            S.last_tune = f"{len(S.rounds)} rounds, answer position {info['base']:.0f} -> {info['tuned']:.0f}"
+            log.info("TUNER: settings improved (%s): %s", S.last_tune, new)
+        else:
+            S.last_tune = "no change (" + (info.get("note") or f"{info.get('rounds', 0)} rounds, best gain {100 * info.get('gain', 0):.0f}%") + ")"
+            log.info("TUNER: %s", S.last_tune)
+    except Exception:
+        log.exception("tuner failed")
+    finally:
+        S.tune_busy = False
+
+
+async def after_round():
+    await asyncio.sleep(1)
+    await save_state()
+    await tune_now()
+    if S.saved_params:
+        await save_state()
+
+
 # ---------------- main loop ----------------
 async def play():
     ensure_solver()
@@ -1098,6 +1237,9 @@ async def play():
     if EMB["model"] is None:
         log.error("!!! SOLVER IS NOT ACTIVE (%s). Guesses will be weak/random. Check that emb_glove.npz, emb_fasttext.npz and solver.py "
                   "are next to bot.py, and that the server has enough memory (look for 'SOLVER' lines above).", EMB["state"])
+    await load_state()
+    if S.saved_params:
+        apply_params(S.saved_params)
     await resync_from_history()
     if STOP_AFTER_ROUNDS or STOP_AFTER_HOURS:
         set_timer(rounds=STOP_AFTER_ROUNDS or None, hours=STOP_AFTER_HOURS or None); log.info("Startup %s", timer_text())
@@ -1145,6 +1287,8 @@ async def play():
             word = nxt[0] if nxt else await pick_word(http)
             nxt = None
             if not word:
+                if time.time() - S.last_nopick > 30:
+                    S.last_nopick = time.time(); log.warning("no word could be chosen (tried %d, known %d, solver %s)", len(S.tried), len(S.known), EMB["state"])
                 await asyncio.sleep(2); continue
             if word in S.tried:                                 # last line of defence against repeats
                 log.warning("BLOCKED duplicate word '%s'", word); await asyncio.sleep(0.5); continue

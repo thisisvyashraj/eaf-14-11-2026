@@ -110,3 +110,20 @@ Still restarting? In Render -> Environment add `EMB_FILES=emb_glove.npz` (one mo
 * The 5-minute "abandon" rule only applies after at least 15 guesses (STALE_MIN_GUESSES), so a slow server cannot end rounds before it has tried.
 * A watchdog logs `STALL: ...` if a round is active but nothing was sent for 90 s, and re-syncs after 4 min.
 * `/debug?key=CONTROL_KEY` (also a button on /panel) shows the status and the last 200 log lines - copy them to me when something goes wrong.
+
+## v5.0 - it learns (and the bugs your last log showed)
+Bugs fixed, found in your log:
+* "GUESS [EMERGENCY/random ...]" with an empty word = the solver had no word left to try (it only probed ~330 concepts while no clue was "near"). It now keeps
+  probing with the ~4000 most common words, each as far as possible from everything tried, and never runs dry (tested with 1500 "everything is far" guesses).
+* Iris' newer announcement ("WORD TRACE / Duration: 45min / Join - /trace ...") is now recognised as a new session (before, the bot did not notice it and sent `.trace` again).
+* "Very far" ranks (#100001 or beyond the vocabulary) are no longer thrown away: they now tell the solver which regions NOT to look in
+  (simulation with 73% capped ranks: words solved in <=30 guesses went from 8/30 to 17/30; no change when nothing is capped).
+* Past answers no longer get a big bonus (they were being guessed first and were all wrong).
+Self-improvement:
+* After every finished round the bot stores the round (the ranks Iris gave + the answer). tuner.py then replays ALL stored rounds and re-picks a few settings
+  (assumed vocabulary size, weight of the two word models, centroid weight, far-rank weight, word-frequency prior) so that the true answers rank as high as possible,
+  also when only half or a quarter of the clues are used. Takes a few seconds, runs between rounds, and only changes settings if it helps by >= 5%.
+* Everything it learns (rounds, answers, tuned settings) is saved as ONE file in the bot account's Saved Messages ("tracebot_state.json" - please do not delete it),
+  because Render wipes its own disk on every restart. It is loaded again at start.
+* `status` and /debug show how many rounds it has learned from and the last tuning result. It needs about 4 finished rounds (it starts with the 2 real rounds I have logs for).
+Honest limits: it improves the settings, it cannot see inside Iris' word model, and a round whose answer is very far from everything is still hard.

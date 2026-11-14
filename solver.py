@@ -101,6 +101,9 @@ class Ensemble:
         self.m2u = [np.array([self.u.get(w, -1) for w in mod.words]) for mod in models]
         self.rows_ok = [np.nonzero(u >= 0)[0] for u in self.m2u]            # rows of each model that are candidates
         self.uu = [u[r] for u, r in zip(self.m2u, self.rows_ok)]            # ... and their index in the unified list
+        self.u2r = []                                                        # unified index -> row in each model (-1 = not in that model)
+        for mi in range(len(models)):
+            a = np.full(len(self.words), -1, np.int64); a[self.uu[mi]] = self.rows_ok[mi]; self.u2r.append(a)
         self.max_obs = int(os.getenv("EMB_OBS", "10"))
         self.alpha = float(os.getenv("EMB_ALPHA", "1.0"))
         self.maxrank = int(os.getenv("EMB_MAXRANK", "30000"))          # worse than this = no information for the centroid part
@@ -109,11 +112,14 @@ class Ensemble:
         self.concepts = [w for w in dict.fromkeys(CONCEPTS) if w in self.m[0].idx]
         self.zp = float(os.getenv("EMB_ZP", "1.0")); self.zh = float(os.getenv("EMB_ZH", "1.5"))
         self.zlo = float(os.getenv("EMB_ZLO", "3.3")); self.zhi = float(os.getenv("EMB_ZHI", "5.5"))
-        self.hist = np.zeros(0, dtype=np.int64); self.hist_bonus = float(os.getenv("EMB_HIST", "1.5"))
+        self.hist = np.zeros(0, dtype=np.int64); self.hist_bonus = float(os.getenv("EMB_HIST", "0.3"))
         self.nt = int(os.getenv("EMB_NT", "45000"))                  # assumed size of Iris' vocabulary (tuned on real rounds: 35k-50k best)
         self.tpw = float(os.getenv("EMB_TPW", "1.0"))               # how strongly close ranks outweigh far ranks in trilateration
         self.cw = float(os.getenv("EMB_CW", "0.3"))                 # weight of the centroid score next to trilateration
         self.use_tri = os.getenv("EMB_TRI", "1") != "0"
+        self.far_w = float(os.getenv("EMB_FARW", "0.15"))           # weight of "this guess is very far from the secret" (rank beyond the vocabulary)
+        self.far_q = float(os.getenv("EMB_FARQ", "0.5"))            # ... meaning: similarity below this quantile of the guess' neighbours
+        self.mw = [1.0] * len(models)                                # weight of each word model in the average (self-tuned)
         self.zipf = None
         if os.getenv("USE_WORDFREQ", "0") == "1":                      # optional prior; costs ~200 MB of RAM, so OFF by default
             try:
@@ -121,15 +127,37 @@ class Ensemble:
                 self.zipf = np.array([zipf_frequency(w, "en") for w in self.words], dtype=np.float32)
             except Exception as e:
                 log.warning("wordfreq unavailable for the typical-word prior (%r)", e)
-        prior = self.cprior * np.log1p(self.freq / 20000.0)            # computed once, not on every guess
-        if self.zipf is not None and (self.zp or self.zh):
-            prior = prior + self.zp * np.maximum(0.0, self.zlo - self.zipf) + self.zh * np.maximum(0.0, self.zipf - self.zhi)
-        self.prior = prior
+        self.prior = self._make_prior()
         self.stopmask = np.array([w in STOP for w in self.words])
         self.policy = os.getenv("EMB_POLICY", "tri")
         self._lock = threading.RLock()
         self._last = None
         self.new_round()
+
+    def _make_prior(self):
+        """mild preference for commoner words (computed once, not on every guess)"""
+        prior = self.cprior * np.log1p(self.freq / 20000.0)
+        if self.zipf is not None and (self.zp or self.zh):
+            prior = prior + self.zp * np.maximum(0.0, self.zlo - self.zipf) + self.zh * np.maximum(0.0, self.zipf - self.zhi)
+        return prior
+
+    PARAM_NAMES = ("nt", "cw", "tpw", "far_w", "far_q", "cprior", "hist_bonus", "alpha")
+
+    def get_params(self):
+        p = {k: getattr(self, k) for k in self.PARAM_NAMES}
+        p["mw"] = list(self.mw)
+        return p
+
+    def set_params(self, p):
+        """apply tuned parameters (only known names); restarts the incremental state"""
+        with self._lock:
+            for k in self.PARAM_NAMES:
+                if k in p and p[k] is not None:
+                    setattr(self, k, type(getattr(self, k))(p[k]))
+            if "mw" in p and len(p["mw"]) == len(self.m):
+                self.mw = [float(x) for x in p["mw"]]
+            self.prior = self._make_prior()
+            self.new_round()
 
     def new_round(self):
         with self._lock:
@@ -145,7 +173,7 @@ class Ensemble:
     def _tri_sync(self, obs):
         """If Iris ranked guess g at r, the secret's cosine to g should equal the r-th largest cosine among g's neighbours.
         For each NEW guess we add (cos(candidate, g) - target)^2 to a running total over all candidates (one matrix-vector product)."""
-        cur = {w: r for w, r in obs.items() if r < 100000}
+        cur = dict(obs)
         st = self._st
         if st is not None:
             ap = st["ap"]
@@ -160,9 +188,17 @@ class Ensemble:
             nt = min(self.nt, len(mod.words))
             for w, r in new:
                 i = mod.idx.get(w)
-                if i is None or i >= nt or r > nt:
+                if i is None or i >= nt:
                     continue
                 s = mod.Xc @ mod.Xc[i]
+                if r > nt:                                    # beyond the common vocabulary / capped at #100001: only "not close to this word"
+                    if self.far_w <= 0:
+                        continue
+                    k = max(1, int(nt * self.far_q))
+                    t = float(np.partition(s[:nt], nt - k)[nt - k])
+                    s -= t; np.maximum(s, 0.0, out=s); s *= s; s *= self.far_w
+                    st["S"][mi] += s; st["W"][mi] += self.far_w; st["n"][mi] += 1
+                    continue
                 k = int(r)
                 t = float(np.partition(s[:nt], nt - k)[nt - k]) if k < nt else float(s[:nt].min())     # the k-th largest similarity
                 wt = 1.0 / (1.0 + np.log(r)) ** self.tpw
@@ -184,10 +220,10 @@ class Ensemble:
             sc = -(st["S"][mi] / st["W"][mi])
             ref = sc[:nt]
             z = (sc - ref.mean()) / (ref.std() + 1e-9)
-            total[self.uu[mi]] += z[self.rows_ok[mi]]; cnt[self.uu[mi]] += 1
+            total[self.uu[mi]] += self.mw[mi] * z[self.rows_ok[mi]]; cnt[self.uu[mi]] += self.mw[mi]
         if cnt.max() == 0:
             return None
-        sc = total / np.maximum(cnt, 1)
+        sc = total / np.maximum(cnt, 1e-9)
         valid = cnt > 0
         v = sc[valid]; k = max(0, int(0.01 * len(v)))
         sc[~valid] = np.partition(v, k)[k]                           # words outside the common vocabulary: mild penalty
@@ -214,10 +250,10 @@ class Ensemble:
             c = (wts[:, None] * O).sum(0); c /= (np.linalg.norm(c) + 1e-9)
             s = mod.Xc @ c
             z = (s - s.mean()) / (s.std() + 1e-9)
-            total[self.uu[mi]] += z[self.rows_ok[mi]]; cnt[self.uu[mi]] += 1
+            total[self.uu[mi]] += self.mw[mi] * z[self.rows_ok[mi]]; cnt[self.uu[mi]] += self.mw[mi]
         if cnt.max() == 0:
             return None
-        score = total / np.maximum(cnt, 1)
+        score = total / np.maximum(cnt, 1e-9)
         score[cnt == 0] = -99
         self._cen_key, self._cen = key, score
         return score
@@ -298,8 +334,16 @@ class Ensemble:
 
     # ---- no clue yet: explore broad everyday concepts, farthest from what was already tried -------------------
     def explore(self, n, tried):
+        """no clue yet: probe broad everyday concepts, each as far as possible from everything tried so far.
+        Starts with a hand-picked list; when that is used up it continues with the ~4000 most common words, so it never runs dry."""
         mod = self.m[0]
         pool = [w for w in self.concepts if w not in tried and w not in STOP]
+        if len(pool) < max(n, 5):
+            extra = getattr(self, "_probe_pool", None)
+            if extra is None:
+                extra = [w for w in mod.words[:6000] if len(w) >= 4 and w.isalpha() and w not in STOP][:4000]
+                self._probe_pool = extra
+            pool = pool + [w for w in extra if w not in tried and w not in set(pool)]
         if not pool or n <= 0:
             return []
         P = mod.rows([mod.idx[w] for w in pool])
@@ -332,9 +376,13 @@ class Ensemble:
                 f = max(f, 0.5)
         else:
             # trilateration uses every rank, so the solver's own best guess is also informative: explore only at the start
-            k_inf = sum(1 for r in obs.values() if r <= self.nt)
+            k_inf = sum(1 for r in obs.values() if r <= self.nt)              # near / mid-range clues
+            k_far = len(obs) - k_inf                                            # "very far" answers (also information, see far_w)
             if k_inf < int(os.getenv("EMB_KMIN", "3")):
-                f = 1.0 if (best is None or best > 3000) else 0.0
+                if best is not None and best <= 3000:
+                    f = 0.0
+                else:
+                    f = 1.0                                                     # no near clue yet: probe common words, each far from all tried ones
             else:
                 f = float(os.getenv("EMB_FEXP", "0.0")) if (best is not None and best > 5000) else 0.0
         with self._lock:
